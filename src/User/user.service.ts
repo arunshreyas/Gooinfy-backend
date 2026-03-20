@@ -1,10 +1,13 @@
 import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import * as bcrypt from 'bcrypt';
 import { PrismaService } from 'src/prisma.service';
 import { createUserDto } from './dto/createUser.dto';
 import { updateUserDto } from './dto/updateUser.dto';
 
 @Injectable()
 export class UserService {
+  private static readonly SALT_ROUNDS = 10;
+
   constructor(private readonly prisma: PrismaService) {}
 
   private async ensureUserExists(id: string) {
@@ -54,7 +57,7 @@ export class UserService {
     return this.ensureUserExists(id);
   }
 
-  create(data: createUserDto) {
+  async create(data: createUserDto) {
     const payload = this.parsePayload(data);
     const username = payload.username;
     const email = payload.email;
@@ -70,11 +73,16 @@ export class UserService {
       );
     }
 
+    const hashedPassword = await bcrypt.hash(
+      password,
+      UserService.SALT_ROUNDS,
+    );
+
     return this.prisma.user.create({
       data: {
         username,
         email,
-        password,
+        password: hashedPassword,
       },
     });
   }
@@ -94,7 +102,10 @@ export class UserService {
     }
 
     if (typeof payload.password === 'string') {
-      updateData.password = payload.password;
+      updateData.password = await bcrypt.hash(
+        payload.password,
+        UserService.SALT_ROUNDS,
+      );
     }
 
     return this.prisma.user.update({
