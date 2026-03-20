@@ -1,0 +1,57 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id        String     @id @default(cuid())
+  username  String     @unique
+  email     String     @unique
+  password  String
+  createdAt DateTime   @default(now())
+  playlists Playlist[]
+  songs     Song[]
+}
+
+model Playlist {
+  id          String         @id @default(cuid())
+  navidromeId String         @unique
+  name        String
+  userId      String
+  user        User           @relation(fields: [userId], references: [id])
+  songs       PlaylistSong[] // many-to-many bridge
+  createdAt   DateTime       @default(now())
+}
+
+model Song {
+  id          String         @id @default(cuid())
+  navidromeId String         @unique  // song ID from Navidrome
+  title       String
+  artist      String?
+  duration    Int?
+  userId      String         // who uploaded it
+  user        User           @relation(fields: [userId], references: [id])
+  playlists   PlaylistSong[] // many-to-many bridge
+  createdAt   DateTime       @default(now())
+}
+
+// Bridge table — song in a playlist, with order
+model PlaylistSong {
+  id         String   @id @default(cuid())
+  playlistId String
+  songId     String
+  order      Int      // track position in playlist
+  playlist   Playlist @relation(fields: [playlistId], references: [id])
+  song       Song     @relation(fields: [songId], references: [id])
+
+  @@unique([playlistId, songId]) // same song can't appear twice
+}
