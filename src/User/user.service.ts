@@ -1,8 +1,11 @@
-import { BadRequestException, Injectable, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Injectable, NotFoundException } from '@nestjs/common';
 import * as bcrypt from 'bcrypt';
+import type { User } from '@prisma/client';
 import { PrismaService } from 'src/prisma.service';
 import { createUserDto } from './dto/createUser.dto';
 import { updateUserDto } from './dto/updateUser.dto';
+
+type SafeUser = Omit<User, 'password'>;
 
 @Injectable()
 export class UserService {
@@ -10,11 +13,13 @@ export class UserService {
 
   constructor(private readonly prisma: PrismaService) {}
 
+  private sanitizeUser(user: User): SafeUser {
+    const { password: _password, ...safeUser } = user;
+    return safeUser;
+  }
+
   private async ensureUserExists(id: string) {
-    const user = await this.prisma.user.findUnique({
-      where: { id },
-      include: { playlists: false },
-    });
+    const user = await this.prisma.user.findUnique({ where: { id } });
 
     if (!user) {
       throw new NotFoundException(`User with id ${id} not found.`);
@@ -28,33 +33,41 @@ export class UserService {
       throw new BadRequestException('Request body must be a JSON object.');
     }
 
-    const entries = Object.entries(data);
-    if (entries.length === 1) {
-      const [key, value] = entries[0];
-      if (value === '' && key.trim().startsWith('{')) {
-        try {
-          const parsed = JSON.parse(key);
-          if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-            return parsed as Record<string, unknown>;
-          }
-        } catch {
-          throw new BadRequestException('Request body contains invalid JSON.');
-        }
-      }
-    }  
-
     return data as Record<string, unknown>;
   }
 
-  findall() {
-    return this.prisma.user.findMany({
-      orderBy: { id: 'asc' },
-      include: { playlists: false },
+  async findByIdentifier(identifier: string) {
+    return this.prisma.user.findFirst({
+      where: {
+        OR: [{ email: identifier }, { username: identifier }],
+      },
     });
   }
 
-  findOne(id: string) {
-    return this.ensureUserExists(id);
+  async findByEmailOrUsername(email: string, username: string) {
+    return this.prisma.user.findFirst({
+      where: {
+        OR: [{ email }, { username }],
+      },
+    });
+  }
+
+  async findall() {
+    const users = await this.prisma.user.findMany({
+      orderBy: { createdAt: 'desc' },
+    });
+
+    return users.map((user) => this.sanitizeUser(user));
+  }
+
+  async findOne(id: string) {
+    const user = await this.ensureUserExists(id);
+    return this.sanitizeUser(user);
+  }
+
+  async getMe(id: string) {
+    const user = await this.ensureUserExists(id);
+    return this.sanitizeUser(user);
   }
 
   async create(data: createUserDto) {
@@ -68,23 +81,25 @@ export class UserService {
       typeof email !== 'string' ||
       typeof password !== 'string'
     ) {
-      throw new BadRequestException(
-        'username, email, and password are required string fields.',
-      );
+      throw new BadRequestException('username, email, and password are required string fields.');
     }
 
-    const hashedPassword = await bcrypt.hash(
-      password,
-      UserService.SALT_ROUNDS,
-    );
+    const existing = await this.findByEmailOrUsername(email, username);
+    if (existing) {
+      throw new ConflictException('A user with that email or username already exists.');
+    }
 
-    return this.prisma.user.create({
+    const hashedPassword = await bcrypt.hash(password, UserService.SALT_ROUNDS);
+
+    const user = await this.prisma.user.create({
       data: {
         username,
         email,
         password: hashedPassword,
       },
     });
+
+    return this.sanitizeUser(user);
   }
 
   async updateUser(id: string, data: updateUserDto) {
@@ -102,15 +117,14 @@ export class UserService {
     }
 
     if (typeof payload.password === 'string') {
-      updateData.password = await bcrypt.hash(
-        payload.password,
-        UserService.SALT_ROUNDS,
-      );
+      updateData.password = await bcrypt.hash(payload.password, UserService.SALT_ROUNDS);
     }
 
-    return this.prisma.user.update({
+    const user = await this.prisma.user.update({
       where: { id },
       data: updateData,
     });
+
+    return this.sanitizeUser(user);
   }
 }

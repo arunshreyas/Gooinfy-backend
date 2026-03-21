@@ -1,81 +1,61 @@
 import {
   BadRequestException,
   Injectable,
-  InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { Song } from '@prisma/client';
 import { promises as fs } from 'node:fs';
-import { extname, join, parse } from 'node:path';
+import { basename, extname, join } from 'node:path';
+import type { AuthUser } from 'src/common/decorators/current-user.decorator';
 import { PrismaService } from 'src/prisma.service';
 import { SearchSongsDto } from './dto/search-songs.dto';
+import { UploadSongDto } from './dto/upload-song.dto';
+
+type UploadedTrack = {
+  title: string;
+  artist?: string | null;
+  originalFilename: string;
+  buffer: Buffer;
+  size?: number;
+};
 
 @Injectable()
 export class SongService {
   private readonly navidromeUrl: string;
   private readonly navidromeUser: string;
   private readonly navidromePass: string;
-  private readonly navidromeVersion: string;
-  private readonly navidromeClient: string;
   private readonly musicRoot: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
   ) {
-    this.navidromeUrl =
-      this.configService.get<string>('NAVIDROME_URL') ?? 'http://localhost:4533';
-    this.navidromeUser =
-      this.configService.get<string>('NAVIDROME_USER') ?? 'mobbu';
-    this.navidromePass =
-      this.configService.get<string>('NAVIDROME_PASS') ?? 'm3%26Mango';
-    this.navidromeVersion =
-      this.configService.get<string>('NAVIDROME_VERSION') ?? '1.16.1';
-    this.navidromeClient =
-      this.configService.get<string>('NAVIDROME_CLIENT_NAME') ?? 'myapp';
+    this.navidromeUrl = this.configService.get<string>('NAVIDROME_URL') ?? 'http://localhost:4533';
+    this.navidromeUser = this.configService.get<string>('NAVIDROME_USER') ?? 'mobbu';
+    this.navidromePass = this.configService.get<string>('NAVIDROME_PASS') ?? 'm3%26Mango';
     this.musicRoot = this.configService.get<string>('MUSIC_ROOT') ?? 'music';
   }
 
-  private requireUserId(userId: string | undefined): string {
-    if (!userId?.trim()) {
-      throw new BadRequestException('userId is required until JWT auth is wired.');
+  getUserId(user: AuthUser): string {
+    const userId = user.id ?? user.userId ?? user.sub;
+    if (!userId) {
+      throw new BadRequestException('Authenticated user id is missing from JWT payload.');
     }
-
     return userId;
-  }
-
-  private async ensureUserExists(userId: string) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException(`User with id ${userId} not found.`);
-    }
-
-    return user;
-  }
-
-  private async ensureOwnedSong(songId: string, userId: string) {
-    const song = await this.prisma.song.findFirst({
-      where: { id: songId, userId },
-    });
-
-    if (!song) {
-      throw new NotFoundException(`Song with id ${songId} not found for this user.`);
-    }
-
-    return song;
   }
 
   private buildNavidromeParams(extra: Record<string, string | number | undefined>) {
     const params = new URLSearchParams({
       u: this.navidromeUser,
       p: this.navidromePass,
-      v: this.navidromeVersion,
-      c: this.navidromeClient,
+      v: '1.16.1',
+      c: 'myapp',
       f: 'json',
     });
 
     for (const [key, value] of Object.entries(extra)) {
-      if (value !== undefined && value !== null && `${value}`.length > 0) {
+      if (value !== undefined && value !== null) {
         params.append(key, `${value}`);
       }
     }
@@ -83,37 +63,25 @@ export class SongService {
     return params;
   }
 
-  private async navidromeJson(
-    endpoint: string,
-    extra: Record<string, string | number | undefined>,
-  ) {
-    const params = this.buildNavidromeParams(extra);
+  private async navidromeJson(endpoint: string, extra: Record<string, string | number | undefined>) {
     const baseUrl = this.navidromeUrl.replace(/\/$/, '');
+    const params = this.buildNavidromeParams(extra);
     const response = await fetch(`${baseUrl}/rest/${endpoint}.view?${params.toString()}`);
-
-    if (!response.ok) {
-      throw new InternalServerErrorException(
-        `Navidrome request failed with status ${response.status}.`,
-      );
-    }
-
     const data = (await response.json()) as {
       'subsonic-response'?: {
         status?: string;
         error?: { message?: string };
         searchResult3?: { song?: unknown };
-        scanStatus?: unknown;
       };
     };
 
-    const payload = data['subsonic-response'];
-    if (!payload || payload.status !== 'ok') {
-      throw new InternalServerErrorException(
-        payload?.error?.message ?? `Navidrome ${endpoint} request failed.`,
+    if (!response.ok || data['subsonic-response']?.status !== 'ok') {
+      throw new BadRequestException(
+        data['subsonic-response']?.error?.message ?? `Navidrome ${endpoint} failed.`,
       );
     }
 
-    return payload;
+    return data['subsonic-response'];
   }
 
   private normalizeSongs(value: unknown) {
@@ -124,159 +92,178 @@ export class SongService {
     return (Array.isArray(value) ? value : [value]) as Array<Record<string, unknown>>;
   }
 
-  private sanitizeFilename(originalName: string) {
-    const extension = extname(originalName).toLowerCase();
-    const base = parse(originalName).name.replace(/[^a-zA-Z0-9-_]/g, '_');
-    return `${Date.now()}-${base}${extension}`;
+  private async ensureOwnedSong(id: string, userId: string) {
+    const song = await this.prisma.song.findFirst({ where: { id, userId } });
+    if (!song) {
+      throw new NotFoundException(`Song with id ${id} not found.`);
+    }
+    return song;
   }
 
-  private validateAudioFile(file: {
-    originalname: string;
-    mimetype?: string;
-    size?: number;
-  }) {
-    const extension = extname(file.originalname).toLowerCase();
-    const allowedExtensions = new Set(['.mp3', '.flac', '.wav', '.m4a']);
-
-    if (!allowedExtensions.has(extension)) {
-      throw new BadRequestException('Only .mp3, .flac, .wav, and .m4a files are supported.');
+  private validateMp3File(file: { originalFilename: string; size?: number }) {
+    if (!file.originalFilename.toLowerCase().endsWith('.mp3')) {
+      throw new BadRequestException('Only MP3 uploads are supported in this version.');
     }
 
-    if ((file.size ?? 0) <= 0) {
-      throw new BadRequestException('Uploaded file is empty.');
+    if (!file.size || file.size <= 0) {
+      throw new BadRequestException('Uploaded song file is empty.');
     }
   }
 
-  private async waitForIndexedSong(query: string, userId: string) {
-    const attempts = 8;
-    for (let attempt = 0; attempt < attempts; attempt += 1) {
-      const payload = await this.navidromeJson('search3', {
-        query,
-        songCount: 10,
-        albumCount: 0,
-        artistCount: 0,
-      });
-      const songs = this.normalizeSongs(payload.searchResult3?.song);
-      const matched = songs.find((song) => {
-        const title = typeof song.title === 'string' ? song.title.toLowerCase() : '';
-        const path = typeof song.path === 'string' ? song.path.toLowerCase() : '';
-        const probe = query.toLowerCase();
-        return title.includes(probe) || path.includes(`${userId.toLowerCase()}/`);
-      });
-
-      if (matched) {
-        return matched;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-    }
-
-    throw new InternalServerErrorException(
-      'Upload reached Navidrome scan, but the song was not indexed in time.',
-    );
+  private titleFromFilename(filename: string) {
+    const ext = extname(filename);
+    return basename(filename, ext);
   }
 
-  async uploadSong(
-    file: { buffer: Buffer; originalname: string; mimetype?: string; size?: number } | undefined,
-    userIdInput: string | undefined,
-  ) {
-    const userId = this.requireUserId(userIdInput);
-    await this.ensureUserExists(userId);
-
-    if (!file) {
-      throw new BadRequestException('An audio file is required.');
-    }
-
-    this.validateAudioFile(file);
-
-    const safeFilename = this.sanitizeFilename(file.originalname);
+  private async writeTrackToDisk(userId: string, track: UploadedTrack) {
     const userDirectory = join(this.musicRoot, userId);
     await fs.mkdir(userDirectory, { recursive: true });
+    const filePath = join(userDirectory, track.originalFilename);
+    await fs.writeFile(filePath, track.buffer);
+  }
 
-    const storedPath = join(userDirectory, safeFilename);
-    await fs.writeFile(storedPath, file.buffer);
-
+  private async waitForScan() {
     await this.navidromeJson('startScan', {});
-    const indexedSong = await this.waitForIndexedSong(parse(file.originalname).name, userId);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+  }
 
-    const navidromeId = typeof indexedSong.id === 'string' ? indexedSong.id : null;
-    const title = typeof indexedSong.title === 'string' ? indexedSong.title : parse(file.originalname).name;
-    const artist = typeof indexedSong.artist === 'string' ? indexedSong.artist : null;
-    const duration = typeof indexedSong.duration === 'number' ? indexedSong.duration : null;
+  private async findNavidromeSongByTitle(title: string) {
+    const search = await this.navidromeJson('search3', {
+      query: title,
+      songCount: 20,
+      albumCount: 0,
+      artistCount: 0,
+    });
+
+    const songs = this.normalizeSongs(search.searchResult3?.song);
+    const exact = songs.find((song) => {
+      const songTitle = typeof song.title === 'string' ? song.title.toLowerCase() : '';
+      return songTitle === title.toLowerCase();
+    });
+
+    return exact ?? songs[0];
+  }
+
+  private async saveTrackRecord(userId: string, track: UploadedTrack): Promise<Song> {
+    const matched = await this.findNavidromeSongByTitle(track.title);
+    const navidromeId = typeof matched?.id === 'string' ? matched.id : undefined;
 
     if (!navidromeId) {
-      throw new InternalServerErrorException('Navidrome indexed the song without returning an id.');
+      throw new NotFoundException(`Uploaded song "${track.title}" was not found in Navidrome after scan.`);
     }
 
     return this.prisma.song.upsert({
       where: { navidromeId },
       update: {
-        title,
-        artist,
-        duration,
+        title: track.title,
+        artist: track.artist ?? null,
         userId,
       },
       create: {
         navidromeId,
-        title,
-        artist,
-        duration,
+        title: track.title,
+        artist: track.artist ?? null,
         userId,
       },
     });
   }
 
-  async searchSongs(dto: SearchSongsDto) {
-    const query = dto.query?.trim();
-    if (!query) {
-      throw new BadRequestException('query is required.');
+  async ingestUploadedTracks(
+    files: Array<{ buffer: Buffer; originalname: string; size?: number }>,
+    user: AuthUser,
+    metadata?: Array<{ title?: string; artist?: string | null }>,
+  ): Promise<Song[]> {
+    const userId = this.getUserId(user);
+
+    if (!files.length) {
+      throw new BadRequestException('At least one song file is required.');
     }
 
-    const payload = await this.navidromeJson('search3', {
-      query,
+    const tracks: UploadedTrack[] = files.map((file, index) => {
+      const meta = metadata?.[index];
+      const title = meta?.title?.trim() || this.titleFromFilename(file.originalname);
+      const artist = meta?.artist?.trim() || null;
+
+      const track = {
+        title,
+        artist,
+        originalFilename: file.originalname,
+        buffer: file.buffer,
+        size: file.size,
+      };
+
+      this.validateMp3File(track);
+      return track;
+    });
+
+    for (const track of tracks) {
+      await this.writeTrackToDisk(userId, track);
+    }
+
+    await this.waitForScan();
+
+    const savedSongs: Song[] = [];
+    for (const track of tracks) {
+      savedSongs.push(await this.saveTrackRecord(userId, track));
+    }
+
+    return savedSongs;
+  }
+
+  async uploadSong(
+    file: { buffer: Buffer; originalname: string; size?: number } | undefined,
+    body: UploadSongDto,
+    user: AuthUser,
+  ) {
+    if (!file) {
+      throw new BadRequestException('song file is required.');
+    }
+
+    const [savedSong] = await this.ingestUploadedTracks(
+      [file],
+      user,
+      [{ title: body.title, artist: body.artist ?? null }],
+    );
+
+    return savedSong;
+  }
+
+  async searchSongs(dto: SearchSongsDto) {
+    const result = await this.navidromeJson('search3', {
+      query: dto.query,
       songCount: dto.limit ?? 20,
       albumCount: 0,
       artistCount: 0,
     });
 
-    return this.normalizeSongs(payload.searchResult3?.song);
+    return this.normalizeSongs(result.searchResult3?.song);
   }
 
-  async getMySongs(userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    await this.ensureUserExists(userId);
+  buildStreamUrl(navidromeId: string) {
+    const params = this.buildNavidromeParams({ id: navidromeId });
+    return `${this.navidromeUrl.replace(/\/$/, '')}/rest/stream.view?${params.toString()}`;
+  }
 
+  getStreamUrl(navidromeId: string) {
+    return {
+      url: this.buildStreamUrl(navidromeId),
+    };
+  }
+
+  async getMySongs(user: AuthUser) {
+    const userId = this.getUserId(user);
     return this.prisma.song.findMany({
       where: { userId },
       orderBy: { createdAt: 'desc' },
     });
   }
 
-  async getStreamUrl(songId: string, userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    const song = await this.ensureOwnedSong(songId, userId);
-    const params = this.buildNavidromeParams({ id: song.navidromeId });
+  async deleteSong(id: string, user: AuthUser) {
+    const userId = this.getUserId(user);
+    const song = await this.ensureOwnedSong(id, userId);
 
-    return {
-      songId: song.id,
-      navidromeId: song.navidromeId,
-      streamUrl: `${this.navidromeUrl.replace(/\/$/, '')}/rest/stream.view?${params.toString()}`,
-    };
-  }
+    await this.prisma.song.delete({ where: { id: song.id } });
 
-  async deleteSong(songId: string, userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    const song = await this.ensureOwnedSong(songId, userId);
-
-    await this.prisma.$transaction([
-      this.prisma.playlistSong.deleteMany({ where: { songId: song.id } }),
-      this.prisma.song.delete({ where: { id: song.id } }),
-    ]);
-
-    return {
-      message: 'Song removed from Goonify metadata. The media file remains on disk/Navidrome.',
-      songId: song.id,
-      navidromeId: song.navidromeId,
-    };
+    return { message: 'Song deleted' };
   }
 }

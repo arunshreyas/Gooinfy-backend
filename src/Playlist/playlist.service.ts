@@ -1,43 +1,39 @@
 import {
-  BadRequestException,
+  ConflictException,
+  ForbiddenException,
   Injectable,
-  InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import type { Song } from '@prisma/client';
 import { ConfigService } from '@nestjs/config';
+import type { AuthUser } from 'src/common/decorators/current-user.decorator';
 import { PrismaService } from 'src/prisma.service';
+import { SongService } from 'src/Song/song.service';
 import { AddPlaylistSongDto } from './dto/add-playlist-song.dto';
 import { CreatePlaylistDto } from './dto/create-playlist.dto';
+import { UploadPlaylistDto } from './dto/upload-playlist.dto';
 
 @Injectable()
 export class PlaylistService {
   private readonly navidromeUrl: string;
   private readonly navidromeUser: string;
   private readonly navidromePass: string;
-  private readonly navidromeVersion: string;
-  private readonly navidromeClient: string;
 
   constructor(
     private readonly prisma: PrismaService,
     private readonly configService: ConfigService,
+    private readonly songService: SongService,
   ) {
-    this.navidromeUrl =
-      this.configService.get<string>('NAVIDROME_URL') ?? 'http://localhost:4533';
-    this.navidromeUser =
-      this.configService.get<string>('NAVIDROME_USER') ?? 'mobbu';
-    this.navidromePass =
-      this.configService.get<string>('NAVIDROME_PASS') ?? 'm3%26Mango';
-    this.navidromeVersion =
-      this.configService.get<string>('NAVIDROME_VERSION') ?? '1.16.1';
-    this.navidromeClient =
-      this.configService.get<string>('NAVIDROME_CLIENT_NAME') ?? 'myapp';
+    this.navidromeUrl = this.configService.get<string>('NAVIDROME_URL') ?? 'http://localhost:4533';
+    this.navidromeUser = this.configService.get<string>('NAVIDROME_USER') ?? 'mobbu';
+    this.navidromePass = this.configService.get<string>('NAVIDROME_PASS') ?? 'm3%26Mango';
   }
 
-  private requireUserId(userId: string | undefined): string {
-    if (!userId?.trim()) {
-      throw new BadRequestException('userId is required until JWT auth is wired.');
+  private getUserId(user: AuthUser): string {
+    const userId = user.id ?? user.userId ?? user.sub;
+    if (!userId) {
+      throw new ForbiddenException('Authenticated user id is missing from JWT payload.');
     }
-
     return userId;
   }
 
@@ -45,13 +41,13 @@ export class PlaylistService {
     const params = new URLSearchParams({
       u: this.navidromeUser,
       p: this.navidromePass,
-      v: this.navidromeVersion,
-      c: this.navidromeClient,
+      v: '1.16.1',
+      c: 'myapp',
       f: 'json',
     });
 
     for (const [key, value] of Object.entries(extra)) {
-      if (value !== undefined && value !== null && `${value}`.length > 0) {
+      if (value !== undefined && value !== null) {
         params.append(key, `${value}`);
       }
     }
@@ -59,50 +55,30 @@ export class PlaylistService {
     return params;
   }
 
-  private async navidromeJson(
-    endpoint: string,
-    extra: Record<string, string | number | undefined>,
-  ) {
-    const params = this.buildNavidromeParams(extra);
+  private async navidromeJson(endpoint: string, extra: Record<string, string | number | undefined>) {
     const baseUrl = this.navidromeUrl.replace(/\/$/, '');
+    const params = this.buildNavidromeParams(extra);
     const response = await fetch(`${baseUrl}/rest/${endpoint}.view?${params.toString()}`);
-
-    if (!response.ok) {
-      throw new InternalServerErrorException(
-        `Navidrome request failed with status ${response.status}.`,
-      );
-    }
-
     const data = (await response.json()) as {
       'subsonic-response'?: {
         status?: string;
         error?: { message?: string };
-        playlist?: Record<string, unknown>;
+        playlist?: { id?: string };
       };
     };
 
-    const payload = data['subsonic-response'];
-    if (!payload || payload.status !== 'ok') {
-      throw new InternalServerErrorException(
-        payload?.error?.message ?? `Navidrome ${endpoint} request failed.`,
+    if (!response.ok || data['subsonic-response']?.status !== 'ok') {
+      throw new NotFoundException(
+        data['subsonic-response']?.error?.message ?? `Navidrome ${endpoint} failed.`,
       );
     }
 
-    return payload;
+    return data['subsonic-response'];
   }
 
-  private async ensureUserExists(userId: string) {
-    const user = await this.prisma.user.findUnique({ where: { id: userId } });
-    if (!user) {
-      throw new NotFoundException(`User with id ${userId} not found.`);
-    }
-
-    return user;
-  }
-
-  private async ensureOwnedPlaylist(playlistId: string, userId: string) {
-    const playlist = await this.prisma.playlist.findFirst({
-      where: { id: playlistId, userId },
+  private async getOwnedPlaylistOrThrow(id: string, userId: string) {
+    const playlist = await this.prisma.playlist.findUnique({
+      where: { id },
       include: {
         songs: {
           include: { song: true },
@@ -112,69 +88,41 @@ export class PlaylistService {
     });
 
     if (!playlist) {
-      throw new NotFoundException(`Playlist with id ${playlistId} not found for this user.`);
+      throw new NotFoundException(`Playlist with id ${id} not found.`);
+    }
+
+    if (playlist.userId !== userId) {
+      throw new ForbiddenException('You do not own this playlist.');
     }
 
     return playlist;
   }
 
-  private async ensureOwnedSong(songId: string, userId: string) {
-    const song = await this.prisma.song.findFirst({
-      where: { id: songId, userId },
-    });
+  async uploadPlaylist(
+    files: Array<{ buffer: Buffer; originalname: string; size?: number }>,
+    body: UploadPlaylistDto,
+    user: AuthUser,
+  ) {
+    const userId = this.getUserId(user);
+    const savedSongs: Song[] = await this.songService.ingestUploadedTracks(files, user);
+    const payload = await this.navidromeJson('createPlaylist', { name: body.name });
+    const navidromeId = payload.playlist?.id;
 
-    if (!song) {
-      throw new NotFoundException(`Song with id ${songId} not found for this user.`);
+    if (!navidromeId) {
+      throw new NotFoundException('Navidrome did not return a playlist id.');
     }
 
-    return song;
-  }
-
-  async createPlaylist(dto: CreatePlaylistDto) {
-    const userId = this.requireUserId(dto.userId);
-    await this.ensureUserExists(userId);
-
-    const songs = dto.songIds?.length
-      ? await Promise.all(dto.songIds.map((songId) => this.ensureOwnedSong(songId, userId)))
-      : [];
-
-    const payload = await this.navidromeJson('createPlaylist', {
-      name: dto.name,
-    });
-
-    const navidromePlaylistId = payload.playlist?.id;
-    if (typeof navidromePlaylistId !== 'string') {
-      throw new InternalServerErrorException('Navidrome did not return a playlist id.');
-    }
-
-    if (songs.length > 0) {
-      const addParams = this.buildNavidromeParams({ playlistId: navidromePlaylistId });
-      for (const song of songs) {
-        addParams.append('songIdToAdd', song.navidromeId);
-      }
-      const baseUrl = this.navidromeUrl.replace(/\/$/, '');
-      const response = await fetch(`${baseUrl}/rest/updatePlaylist.view?${addParams.toString()}`);
-      const data = (await response.json()) as { 'subsonic-response'?: { status?: string; error?: { message?: string } } };
-      if (!response.ok || data['subsonic-response']?.status !== 'ok') {
-        throw new InternalServerErrorException(
-          data['subsonic-response']?.error?.message ?? 'Failed to sync playlist songs to Navidrome.',
-        );
-      }
-    }
-
-    return this.prisma.playlist.create({
+    const playlist = await this.prisma.playlist.create({
       data: {
-        navidromeId: navidromePlaylistId,
-        name: dto.name,
+        navidromeId,
+        name: body.name,
         userId,
-        songs: songs.length
-          ? {
-              create: songs.map((song, index) => ({
-                songId: song.id,
-                order: index + 1,
-              })),
-            }
-          : undefined,
+        songs: {
+          create: savedSongs.map((song, index) => ({
+            songId: song.id,
+            order: index + 1,
+          })),
+        },
       },
       include: {
         songs: {
@@ -183,12 +131,46 @@ export class PlaylistService {
         },
       },
     });
+
+    for (const song of savedSongs) {
+      await this.navidromeJson('updatePlaylist', {
+        playlistId: navidromeId,
+        songIdToAdd: song.navidromeId,
+      });
+    }
+
+    return {
+      message: 'Playlist uploaded successfully',
+      playlist: {
+        ...playlist,
+        songs: playlist.songs.map((entry) => ({
+          ...entry,
+          streamUrl: this.songService.buildStreamUrl(entry.song.navidromeId),
+        })),
+      },
+    };
   }
 
-  async getPlaylists(userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    await this.ensureUserExists(userId);
+  async createPlaylist(body: CreatePlaylistDto, user: AuthUser) {
+    const userId = this.getUserId(user);
+    const payload = await this.navidromeJson('createPlaylist', { name: body.name });
+    const navidromeId = payload.playlist?.id;
 
+    if (!navidromeId) {
+      throw new NotFoundException('Navidrome did not return a playlist id.');
+    }
+
+    return this.prisma.playlist.create({
+      data: {
+        navidromeId,
+        name: body.name,
+        userId,
+      },
+    });
+  }
+
+  async getPlaylists(user: AuthUser) {
+    const userId = this.getUserId(user);
     return this.prisma.playlist.findMany({
       where: { userId },
       include: {
@@ -201,91 +183,69 @@ export class PlaylistService {
     });
   }
 
-  async getPlaylist(playlistId: string, userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    return this.ensureOwnedPlaylist(playlistId, userId);
+  async getPlaylist(id: string, user: AuthUser) {
+    const userId = this.getUserId(user);
+    return this.getOwnedPlaylistOrThrow(id, userId);
   }
 
-  async addSongToPlaylist(playlistId: string, dto: AddPlaylistSongDto) {
-    const userId = this.requireUserId(dto.userId);
-    const playlist = await this.ensureOwnedPlaylist(playlistId, userId);
-    const song = await this.ensureOwnedSong(dto.songId, userId);
+  async addSongToPlaylist(id: string, body: AddPlaylistSongDto, user: AuthUser) {
+    const userId = this.getUserId(user);
+    const playlist = await this.getOwnedPlaylistOrThrow(id, userId);
 
-    const existing = playlist.songs.find((item) => item.songId === song.id);
-    if (existing) {
-      throw new BadRequestException('Song is already in this playlist.');
+    const song = await this.prisma.song.findUnique({ where: { id: body.songId } });
+    if (!song) {
+      throw new NotFoundException(`Song with id ${body.songId} not found.`);
     }
 
-    const nextOrder = dto.order ?? playlist.songs.length + 1;
+    const existing = await this.prisma.playlistSong.findFirst({
+      where: { playlistId: playlist.id, songId: song.id },
+    });
+    if (existing) {
+      throw new ConflictException('Song already exists in this playlist.');
+    }
+
+    const order = await this.prisma.playlistSong.count({ where: { playlistId: playlist.id } }) + 1;
+
+    await this.prisma.playlistSong.create({
+      data: {
+        playlistId: playlist.id,
+        songId: song.id,
+        order,
+      },
+    });
 
     await this.navidromeJson('updatePlaylist', {
       playlistId: playlist.navidromeId,
       songIdToAdd: song.navidromeId,
     });
 
-    await this.prisma.playlistSong.create({
-      data: {
-        playlistId: playlist.id,
-        songId: song.id,
-        order: nextOrder,
-      },
-    });
-
-    return this.ensureOwnedPlaylist(playlistId, userId);
+    return { message: 'Song added to playlist' };
   }
 
-  async removeSongFromPlaylist(
-    playlistId: string,
-    songId: string,
-    userIdInput: string | undefined,
-  ) {
-    const userId = this.requireUserId(userIdInput);
-    const playlist = await this.ensureOwnedPlaylist(playlistId, userId);
-    const songIndex = playlist.songs.findIndex((entry) => entry.songId === songId);
+  async removeSongFromPlaylist(id: string, songId: string, user: AuthUser) {
+    const userId = this.getUserId(user);
+    const playlist = await this.getOwnedPlaylistOrThrow(id, userId);
 
-    if (songIndex === -1) {
+    const playlistSong = await this.prisma.playlistSong.findFirst({
+      where: { playlistId: playlist.id, songId },
+    });
+
+    if (!playlistSong) {
       throw new NotFoundException(`Song with id ${songId} is not in this playlist.`);
     }
 
-    await this.navidromeJson('updatePlaylist', {
-      playlistId: playlist.navidromeId,
-      songIndexToRemove: songIndex,
-    });
+    await this.prisma.playlistSong.delete({ where: { id: playlistSong.id } });
 
-    await this.prisma.playlistSong.deleteMany({
-      where: {
-        playlistId,
-        songId,
-      },
-    });
-
-    const remainingSongs = playlist.songs.filter((entry) => entry.songId !== songId);
-    await Promise.all(
-      remainingSongs.map((entry, index) =>
-        this.prisma.playlistSong.update({
-          where: { id: entry.id },
-          data: { order: index + 1 },
-        }),
-      ),
-    );
-
-    return this.ensureOwnedPlaylist(playlistId, userId);
+    return { message: 'Song removed from playlist' };
   }
 
-  async deletePlaylist(playlistId: string, userIdInput: string | undefined) {
-    const userId = this.requireUserId(userIdInput);
-    const playlist = await this.ensureOwnedPlaylist(playlistId, userId);
+  async deletePlaylist(id: string, user: AuthUser) {
+    const userId = this.getUserId(user);
+    const playlist = await this.getOwnedPlaylistOrThrow(id, userId);
 
     await this.navidromeJson('deletePlaylist', { id: playlist.navidromeId });
-    await this.prisma.$transaction([
-      this.prisma.playlistSong.deleteMany({ where: { playlistId: playlist.id } }),
-      this.prisma.playlist.delete({ where: { id: playlist.id } }),
-    ]);
+    await this.prisma.playlist.delete({ where: { id: playlist.id } });
 
-    return {
-      message: 'Playlist deleted successfully.',
-      playlistId: playlist.id,
-      navidromeId: playlist.navidromeId,
-    };
+    return { message: 'Playlist deleted' };
   }
 }

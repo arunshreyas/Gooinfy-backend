@@ -1,7 +1,7 @@
 import { IsNotEmpty, IsString } from 'class-validator';
 
-export class AddPlaylistSongDto {
+export class UploadPlaylistDto {
   @IsString()
   @IsNotEmpty()
-  songId: string;
+  name: string;
 }
